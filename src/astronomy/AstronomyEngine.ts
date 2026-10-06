@@ -61,10 +61,12 @@ export class AstronomyEngine {
     const observer = new Astronomy.Observer(location.latitude, location.longitude, location.altitude || 0);
     const astroTime = new Astronomy.AstroTime(date);
 
-    // 1. Process Fixed Catalog Stars
+    // 1. Process Fixed Catalog Stars with J2000 -> Current Epoch Precession
+    const rot = Astronomy.Rotation_EQJ_EQD(astroTime);
     const stars: SkyObject[] = STAR_CATALOG.map((star) => {
-      // Use astronomy-engine Horizon transformation with precession & refraction
-      const horizon = Astronomy.Horizon(astroTime, observer, star.ra, star.dec, 'normal');
+      const v = Astronomy.VectorFromSphere(new Astronomy.Spherical(star.dec, star.ra * 15, 1), astroTime);
+      const eq = Astronomy.EquatorFromVector(Astronomy.RotateVector(rot, v));
+      const horizon = Astronomy.Horizon(astroTime, observer, eq.ra, eq.dec, 'normal');
       const altitude = horizon.altitude;
       const azimuth = horizon.azimuth;
 
@@ -76,7 +78,7 @@ export class AstronomyEngine {
       };
     });
 
-    // 2. Add Moon and Solar System Planets
+    // 2. Add Moon and Solar System Planets with Real Illumination & Magnitude
     const moonEquator = Astronomy.Equator(Astronomy.Body.Moon, astroTime, observer, true, true);
     const moonHorizon = Astronomy.Horizon(astroTime, observer, moonEquator.ra, moonEquator.dec, 'normal');
     const moonIllum = Astronomy.Illumination(Astronomy.Body.Moon, astroTime);
@@ -92,9 +94,9 @@ export class AstronomyEngine {
       type: 'planet' as const,
       ra: moonEquator.ra,
       dec: moonEquator.dec,
-      magnitude: -12.7 * (moonIllum.phase_fraction || 0.5) - 2.5,
+      magnitude: Number(moonIllum.mag.toFixed(1)),
       distanceLightYears: 0.0000000406, // ~384,400 km
-      description: `Earth's only natural satellite. Phase: ${moonPhaseName} (${Math.round((moonIllum.phase_fraction || 0.5) * 100)}% illuminated). Approx distance 384,400 km.`,
+      description: `Earth's only natural satellite. Phase: ${moonPhaseName} (${Math.round(moonIllum.phase_fraction * 100)}% illuminated). Approx distance 384,400 km.`,
       mythology: 'Revered in ancient Indian astronomy as Chandra (Soma), celestial ruler of tides, minds, and night rhythms.',
       missionHint: 'Look for the luminous crescent or disk of the Moon glowing against the stars.',
       altitude: moonHorizon.altitude,
@@ -103,23 +105,24 @@ export class AstronomyEngine {
     };
 
     const planetsToCompute = [
-      { body: Astronomy.Body.Mercury, id: 'mercury', name: 'Mercury', mag: -0.4, desc: 'The smallest planet and closest to the Sun.' },
-      { body: Astronomy.Body.Venus, id: 'venus', name: 'Venus', mag: -4.4, desc: 'The Evening/Morning Star, shrouded in reflective clouds of sulfuric acid.' },
-      { body: Astronomy.Body.Mars, id: 'mars', name: 'Mars', mag: -1.0, desc: 'The Red Planet, illuminated by iron oxide on its rusty desert surface.' },
-      { body: Astronomy.Body.Jupiter, id: 'jupiter', name: 'Jupiter', mag: -2.7, desc: 'The king of planets, a gas giant with prominent Galilean moons.' },
-      { body: Astronomy.Body.Saturn, id: 'saturn', name: 'Saturn', mag: 0.5, desc: 'The jewel of the solar system, surrounded by icy rings.' }
+      { body: Astronomy.Body.Mercury, id: 'mercury', name: 'Mercury', desc: 'The smallest planet and closest to the Sun.' },
+      { body: Astronomy.Body.Venus, id: 'venus', name: 'Venus', desc: 'The Evening/Morning Star, shrouded in reflective clouds of sulfuric acid.' },
+      { body: Astronomy.Body.Mars, id: 'mars', name: 'Mars', desc: 'The Red Planet, illuminated by iron oxide on its rusty desert surface.' },
+      { body: Astronomy.Body.Jupiter, id: 'jupiter', name: 'Jupiter', desc: 'The king of planets, a gas giant with prominent Galilean moons.' },
+      { body: Astronomy.Body.Saturn, id: 'saturn', name: 'Saturn', desc: 'The jewel of the solar system, surrounded by icy rings.' }
     ];
 
     const computedPlanets: SkyObject[] = planetsToCompute.map((p) => {
       const eq = Astronomy.Equator(p.body, astroTime, observer, true, true);
       const hor = Astronomy.Horizon(astroTime, observer, eq.ra, eq.dec, 'normal');
+      const illum = Astronomy.Illumination(p.body, astroTime);
       return {
         id: p.id,
         name: p.name,
         type: 'planet' as const,
         ra: eq.ra,
         dec: eq.dec,
-        magnitude: p.mag,
+        magnitude: Number(illum.mag.toFixed(2)),
         description: p.desc,
         altitude: hor.altitude,
         azimuth: hor.azimuth,

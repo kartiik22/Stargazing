@@ -1,7 +1,8 @@
 import React from 'react';
-import { View, Text, StyleSheet, Dimensions, TouchableOpacity } from 'react-native';
-import Svg, { Line, Circle } from 'react-native-svg';
+import { View, Text, StyleSheet, TouchableOpacity, useWindowDimensions } from 'react-native';
+import Svg, { Line } from 'react-native-svg';
 import { SkyObject, DeviceOrientation, Constellation } from '../types/astronomy';
+import { projectToScreen, matrixFromAltAz } from '../astronomy/projection';
 
 interface SkyOverlayProps {
   objects: SkyObject[];
@@ -10,8 +11,7 @@ interface SkyOverlayProps {
   selectedObjectId?: string | null;
   targetMissionObjectId?: string | null;
   onSelectObject: (obj: SkyObject) => void;
-  horizontalFov?: number; // default ~60 degrees for standard phone camera
-  verticalFov?: number;   // default ~75 degrees
+  verticalFov?: number;   // default ~63 degrees
 }
 
 export const SkyOverlay: React.FC<SkyOverlayProps> = ({
@@ -21,85 +21,26 @@ export const SkyOverlay: React.FC<SkyOverlayProps> = ({
   selectedObjectId,
   targetMissionObjectId,
   onSelectObject,
-  horizontalFov = 60,
-  verticalFov = 75,
+  verticalFov = 63,
 }) => {
-  const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  const M = orientation.matrix ?? matrixFromAltAz(orientation.altitude, orientation.azimuth);
 
-  // Convert spherical horizontal coordinates (Alt, Az) to unit 3D Cartesian vectors in observer space
-  // X: East, Y: North, Z: Up (Zenith)
-  const toCartesian = (altDeg: number, azDeg: number) => {
-    const altR = (altDeg * Math.PI) / 180;
-    const azR = (azDeg * Math.PI) / 180;
-    return {
-      x: Math.cos(altR) * Math.sin(azR), // East
-      y: Math.cos(altR) * Math.cos(azR), // North
-      z: Math.sin(altR),                 // Zenith Up
-    };
+  const project = (az: number, alt: number) =>
+    projectToScreen(alt, az, M, verticalFov, screenWidth, screenHeight);
+
+  // for labels: clip to the screen with a margin
+  const getScreenCoordinates = (az: number, alt: number) => {
+    const p = project(az, alt);
+    if (!p || Math.abs(p.nx) > 1.35 || Math.abs(p.ny) > 1.35) return null;
+    return p;
   };
 
-  // Convert an object's (azimuth, altitude) into (screenX, screenY) using 3D camera projection
-  const getScreenCoordinates = (objAz: number, objAlt: number) => {
-    const objV = toCartesian(objAlt, objAz);
-    const camV = toCartesian(orientation.altitude, orientation.azimuth);
-
-    // Camera forward vector: camV
-    // Dot product gives cos(angular separation)
-    const dotForward = objV.x * camV.x + objV.y * camV.y + objV.z * camV.z;
-
-    // Must be in front of the camera (field of view hemisphere)
-    if (dotForward <= 0.2) return null;
-
-    // Up vector for camera:
-    // In portrait, camera "up" points towards higher elevation
-    const altR = (orientation.altitude * Math.PI) / 180;
-    const azR = (orientation.azimuth * Math.PI) / 180;
-
-    // Camera local Right vector (perpendicular to Cam and World Up):
-    // R = Cam x UpWorld = (camY*1 - 0, -camX*1, 0)
-    let rx = Math.cos(azR);
-    let ry = -Math.sin(azR);
-    let rz = 0;
-    const rNorm = Math.sqrt(rx * rx + ry * ry) || 1;
-    rx /= rNorm;
-    ry /= rNorm;
-
-    // Camera local Up vector (Right x Cam):
-    const ux = ry * camV.z - rz * camV.y;
-    const uy = rz * camV.x - rx * camV.z;
-    const uz = rx * camV.y - ry * camV.x;
-
-    // Project obj vector onto camera local axes:
-    const xCam = objV.x * rx + objV.y * ry + objV.z * rz;
-    const yCam = objV.x * ux + objV.y * uy + objV.z * uz;
-    const zCam = dotForward; // along boresight
-
-    // Perspective projection onto screen plane:
-    const tanH = Math.tan(((horizontalFov / 2) * Math.PI) / 180);
-    const tanV = Math.tan(((verticalFov / 2) * Math.PI) / 180);
-
-    const normX = xCam / (zCam * tanH);
-    const normY = yCam / (zCam * tanV);
-
-    // Generous edge margin so labels don't pop abruptly
-    const marginRatio = 1.35;
-    if (Math.abs(normX) > marginRatio || Math.abs(normY) > marginRatio) {
-      return null;
-    }
-
-    const x = screenWidth / 2 + normX * (screenWidth / 2);
-    const y = screenHeight / 2 - normY * (screenHeight / 2);
-
-    return { x, y, diffAz: normX * horizontalFov, diffAlt: normY * verticalFov };
-  };
-
-  // Build coordinate map for constellation line rendering
+  // for constellation lines: NO clipping, only "in front of camera"
   const objectCoordsMap = new Map<string, { x: number; y: number }>();
   objects.forEach((obj) => {
-    const coords = getScreenCoordinates(obj.azimuth, obj.altitude);
-    if (coords) {
-      objectCoordsMap.set(obj.id, { x: coords.x, y: coords.y });
-    }
+    const p = project(obj.azimuth, obj.altitude);
+    if (p) objectCoordsMap.set(obj.id, { x: p.x, y: p.y });
   });
 
   return (

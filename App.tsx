@@ -7,6 +7,7 @@ import { MissionScreen } from './src/screens/MissionScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { HowItWorksScreen } from './src/screens/HowItWorksScreen';
 import { CalibrationModal } from './src/components/CalibrationModal';
+import { SensorFusion } from './src/sensors/SensorFusion';
 import { TouchGrassMission } from './src/types/astronomy';
 
 type AppScreen = 'home' | 'stargazing';
@@ -71,6 +72,7 @@ export default function App() {
           minAltitude={minAltitude}
           onChangeMinAltitude={setMinAltitude}
           onOpenCalibration={() => {
+            SensorFusion.getInstance().startCalibration();
             setShowSettings(false);
             setShowCalibration(true);
           }}
@@ -83,7 +85,10 @@ export default function App() {
 
       <CalibrationModal
         visible={showCalibration}
-        onClose={() => setShowCalibration(false)}
+        onClose={() => {
+          SensorFusion.getInstance().finishCalibration();
+          setShowCalibration(false);
+        }}
         confidence="high"
       />
     </View>

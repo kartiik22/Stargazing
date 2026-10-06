@@ -57,6 +57,7 @@ export interface DeviceOrientation {
   pitch: number;       // raw pitch
   timestamp: number;
   headingConfidence?: 'high' | 'medium' | 'low';
+  matrix?: number[];   // row-major 3x3, device -> world (E,N,U)
 }
 
 export interface TouchGrassMission {

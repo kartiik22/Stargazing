@@ -2,13 +2,101 @@ import { AccelerometerService, AccelerometerData } from './AccelerometerService'
 import { GyroscopeService, GyroscopeData } from './GyroscopeService';
 import { MagnetometerService, MagnetometerData } from './MagnetometerService';
 import { DeviceOrientation } from '../types/astronomy';
+import { Mat3, orientationFromMatrix } from '../astronomy/projection';
 
 export type OrientationListener = (orientation: DeviceOrientation) => void;
 
+/* ------------------------------------------------------------------ *
+ * PLATFORM SWITCHES - verify once on a real phone (see checklist).
+ * ------------------------------------------------------------------ */
+// expo-sensors Accelerometer: phone lying face-up reads z ≈ -1 (reading points DOWN, iOS convention).
+// If altitude comes out mirrored (looking up shows negative), set this to false.
+const GRAVITY_READING_IS_DOWN = true;
+// If turning the phone RIGHT makes azimuth go DOWN after a second or two, flip to -1.
+const GYRO_SIGN = 1;
+
+type V3 = [number, number, number];
+type Q = [number, number, number, number]; // w, x, y, z
+
+/* ----------------------------- math ------------------------------ */
+const cross = (a: V3, b: V3): V3 => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0],
+];
+const len = (a: V3) => Math.hypot(a[0], a[1], a[2]);
+const scale = (a: V3, s: number): V3 => [a[0] * s, a[1] * s, a[2] * s];
+const norm = (a: V3): V3 | null => {
+  const l = len(a);
+  return l < 1e-6 ? null : scale(a, 1 / l);
+};
+const lerp3 = (a: V3, b: V3, k: number): V3 => [
+  a[0] + k * (b[0] - a[0]),
+  a[1] + k * (b[1] - a[1]),
+  a[2] + k * (b[2] - a[2]),
+];
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+const qMul = (a: Q, b: Q): Q => [
+  a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+  a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+  a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+  a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
+];
+const qNormalize = (q: Q): Q => {
+  const l = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+  return [q[0] / l, q[1] / l, q[2] / l, q[3] / l];
+};
+const qNlerp = (a: Q, b: Q, k: number): Q => {
+  const dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  const s = dot < 0 ? -1 : 1; // shortest path
+  return qNormalize([
+    a[0] + k * (s * b[0] - a[0]),
+    a[1] + k * (s * b[1] - a[1]),
+    a[2] + k * (s * b[2] - a[2]),
+    a[3] + k * (s * b[3] - a[3]),
+  ]);
+};
+
+/** Row-major 3x3 -> quaternion */
+const qFromMatrix = (m: Mat3): Q => {
+  const [m00, m01, m02, m10, m11, m12, m20, m21, m22] = m;
+  const t = m00 + m11 + m22;
+  let w: number, x: number, y: number, z: number;
+  if (t > 0) {
+    const s = Math.sqrt(t + 1) * 2;
+    w = s / 4; x = (m21 - m12) / s; y = (m02 - m20) / s; z = (m10 - m01) / s;
+  } else if (m00 > m11 && m00 > m22) {
+    const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
+    w = (m21 - m12) / s; x = s / 4; y = (m01 + m10) / s; z = (m02 + m20) / s;
+  } else if (m11 > m22) {
+    const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
+    w = (m02 - m20) / s; x = (m01 + m10) / s; y = s / 4; z = (m12 + m21) / s;
+  } else {
+    const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
+    w = (m10 - m01) / s; x = (m02 + m20) / s; y = (m12 + m21) / s; z = s / 4;
+  }
+  return qNormalize([w, x, y, z]);
+};
+
+const qToMatrix = (q: Q): Mat3 => {
+  const [w, x, y, z] = q;
+  return [
+    1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+    2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+    2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+  ];
+};
+
+/* --------------------------- the fusion --------------------------- */
 /**
- * SensorFusion fuses Accelerometer (gravity/pitch/roll), Magnetometer (compass heading),
- * and Gyroscope (rotational delta) into a stable camera pointing Azimuth and Altitude.
- * Includes complementary filtering, low-pass smoothing, and compass tilt compensation.
+ * Orientation is a quaternion q that maps DEVICE axes -> WORLD (East, North, Up).
+ *
+ *  1. GYRO     integrates q every sample (fast, smooth, but drifts).
+ *  2. ACCEL+MAG give an absolute (TRIAD) orientation: up from gravity, east = mag x up, north = up x east.
+ *     q is gently pulled toward it with a time-constant based gain, which cancels the drift.
+ *
+ * The output is a full rotation matrix, so ROLL is handled correctly and there is no gimbal problem at the zenith.
  */
 export class SensorFusion {
   private static instance: SensorFusion;
@@ -17,61 +105,64 @@ export class SensorFusion {
   private gyroService = GyroscopeService.getInstance();
   private magService = MagnetometerService.getInstance();
 
-  private unsubAccel: (() => void) | null = null;
-  private unsubGyro: (() => void) | null = null;
-  private unsubMag: (() => void) | null = null;
-
+  private unsubs: Array<() => void> = [];
   private listeners: Set<OrientationListener> = new Set();
-
-  // Current fused state
-  private currentAzimuth = 0;
-  private currentAltitude = 0;
-  private currentRoll = 0;
-  private currentPitch = 0;
-  private lastTimestamp = Date.now();
-
-  // Low-pass smoothing factor (alpha: 0 = no change, 1 = instant change)
-  private readonly alphaAccel = 0.25;
-  private readonly alphaMag = 0.20;
-
-  private smoothedAccel: AccelerometerData = { x: 0, y: 0, z: -1, timestamp: 0 };
-  private smoothedMag: MagnetometerData = { x: 0, y: 0, z: 0, heading: 0, timestamp: 0 };
-
   private isRunning = false;
+
+  private q: Q | null = null;
+  private accel: V3 | null = null; // low-passed raw accelerometer
+  private mag: V3 | null = null;   // low-passed, hard-iron-corrected magnetometer
+
+  private lastGyroTs = 0;
+  private lastCorrectTs = 0;
+
+  // Magnetic declination in degrees, east positive (Delhi ≈ +1°). Gets true north instead of magnetic north.
+  private declinationDeg = 1.0;
+
+  // Hard-iron calibration (figure-eight)
+  private magOffset: V3 = [0, 0, 0];
+  private calibrating = false;
+  private calMin: V3 = [Infinity, Infinity, Infinity];
+  private calMax: V3 = [-Infinity, -Infinity, -Infinity];
+
+  private last: DeviceOrientation = {
+    azimuth: 0, altitude: 0, roll: 0, pitch: 0, timestamp: Date.now(), headingConfidence: 'medium',
+  };
 
   private constructor() {}
 
   public static getInstance(): SensorFusion {
-    if (!SensorFusion.instance) {
-      SensorFusion.instance = new SensorFusion();
-    }
+    if (!SensorFusion.instance) SensorFusion.instance = new SensorFusion();
     return SensorFusion.instance;
   }
+
+  public setDeclination(deg: number): void { this.declinationDeg = deg; }
 
   public start(): void {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    this.accelService.start(30);
-    this.gyroService.start(30);
-    this.magService.start(30);
+    this.accelService.start(20);
+    this.magService.start(20);
+    this.gyroService.start(16);
 
-    this.unsubAccel = this.accelService.subscribe((data) => this.onAccel(data));
-    this.unsubGyro = this.gyroService.subscribe((data) => this.onGyro(data));
-    this.unsubMag = this.magService.subscribe((data) => this.onMag(data));
+    this.unsubs = [
+      this.accelService.subscribe((d) => this.onAccel(d)),
+      this.magService.subscribe((d) => this.onMag(d)),
+      this.gyroService.subscribe((d) => this.onGyro(d)),
+    ];
   }
 
   public stop(): void {
     if (!this.isRunning) return;
     this.isRunning = false;
-
-    if (this.unsubAccel) { this.unsubAccel(); this.unsubAccel = null; }
-    if (this.unsubGyro) { this.unsubGyro(); this.unsubGyro = null; }
-    if (this.unsubMag) { this.unsubMag(); this.unsubMag = null; }
-
+    this.unsubs.forEach((u) => u());
+    this.unsubs = [];
     this.accelService.stop();
     this.gyroService.stop();
     this.magService.stop();
+    this.lastGyroTs = 0;
+    this.lastCorrectTs = 0;
   }
 
   public subscribe(listener: OrientationListener): () => void {
@@ -79,130 +170,152 @@ export class SensorFusion {
     return () => this.listeners.delete(listener);
   }
 
-  private onAccel(data: AccelerometerData): void {
-    // Low pass filter on gravity vector
-    this.smoothedAccel.x += this.alphaAccel * (data.x - this.smoothedAccel.x);
-    this.smoothedAccel.y += this.alphaAccel * (data.y - this.smoothedAccel.y);
-    this.smoothedAccel.z += this.alphaAccel * (data.z - this.smoothedAccel.z);
+  public getOrientation(): DeviceOrientation { return this.last; }
 
-    this.computeOrientation();
+  /* ---- magnetometer hard-iron calibration (wire to CalibrationModal) ---- */
+  public startCalibration(): void {
+    this.calibrating = true;
+    this.calMin = [Infinity, Infinity, Infinity];
+    this.calMax = [-Infinity, -Infinity, -Infinity];
+    this.magOffset = [0, 0, 0];
+    this.mag = null;
   }
 
-  private onGyro(data: GyroscopeData): void {
-    const now = Date.now();
-    const dt = Math.max(0.001, (now - this.lastTimestamp) / 1000);
-    this.lastTimestamp = now;
-
-    // Use gyroscope integration for instant responsiveness between magnetometer updates
-    // Gyro z/y gives delta rotation
-    // Subtle complementary adjustment:
-    const gyroDeltaHeading = (data.z * (180 / Math.PI)) * dt;
-    this.currentAzimuth = (this.currentAzimuth - gyroDeltaHeading + 360) % 360;
+  public finishCalibration(): boolean {
+    this.calibrating = false;
+    const spans = this.calMax.map((mx, i) => mx - this.calMin[i]);
+    // Need real movement on all 3 axes (> ~30 µT of swing) or the result is garbage.
+    if (spans.some((s) => !isFinite(s) || s < 30)) {
+      this.magOffset = [0, 0, 0];
+      return false;
+    }
+    this.magOffset = [
+      (this.calMax[0] + this.calMin[0]) / 2,
+      (this.calMax[1] + this.calMin[1]) / 2,
+      (this.calMax[2] + this.calMin[2]) / 2,
+    ];
+    this.mag = null;
+    return true;
   }
 
-  private onMag(data: MagnetometerData): void {
-    this.smoothedMag.x += this.alphaMag * (data.x - this.smoothedMag.x);
-    this.smoothedMag.y += this.alphaMag * (data.y - this.smoothedMag.y);
-    this.smoothedMag.z += this.alphaMag * (data.z - this.smoothedMag.z);
-
-    this.computeOrientation();
+  /* ----------------------------- inputs ----------------------------- */
+  private gyroActive(now: number): boolean {
+    return this.lastGyroTs > 0 && now - this.lastGyroTs < 150;
   }
 
-  private computeOrientation(): void {
-    const ax = this.smoothedAccel.x;
-    const ay = this.smoothedAccel.y;
-    const az = this.smoothedAccel.z;
+  private onAccel(d: AccelerometerData): void {
+    const a: V3 = [d.x, d.y, d.z];
+    this.accel = this.accel ? lerp3(this.accel, a, 0.3) : a;
+    // Without a gyro the accel/mag stream is the only clock.
+    if (!this.gyroActive(d.timestamp)) this.correctAndEmit(d.timestamp);
+  }
 
-    const mx = this.smoothedMag.x;
-    const my = this.smoothedMag.y;
-    const mz = this.smoothedMag.z;
+  private onMag(d: MagnetometerData): void {
+    const raw: V3 = [d.x, d.y, d.z];
+    if (this.calibrating) {
+      for (let i = 0; i < 3; i++) {
+        this.calMin[i] = Math.min(this.calMin[i], raw[i]);
+        this.calMax[i] = Math.max(this.calMax[i], raw[i]);
+      }
+    }
+    const m: V3 = [raw[0] - this.magOffset[0], raw[1] - this.magOffset[1], raw[2] - this.magOffset[2]];
+    this.mag = this.mag ? lerp3(this.mag, m, 0.2) : m;
+  }
 
-    // In portrait phone orientation:
-    // When held vertically pointing straight ahead: ay ~ -1, az ~ 0
-    // When pointed straight up at the zenith: ay ~ 0, az ~ -1
-    // Pitch/Elevation of the back camera:
-    // Altitude = atan2(-ay, -az) in camera space
-    // Let's compute pitch and roll in radians:
-    const normA = Math.sqrt(ax * ax + ay * ay + az * az) || 1;
-    const nax = ax / normA;
-    const nay = ay / normA;
-    const naz = az / normA;
+  private onGyro(d: GyroscopeData): void {
+    const now = d.timestamp;
+    const prev = this.lastGyroTs;
+    this.lastGyroTs = now;
 
-    // In iPhone/Android portrait orientation:
-    // When holding phone upright looking at horizon:
-    // - Gravity acts downwards: nay ~ -1.0, naz ~ 0.0, nax ~ 0.0
-    // When pointing camera up toward the ceiling/zenith:
-    // - Phone back faces upward: naz ~ -1.0, nay ~ 0.0 (altitude ~ +90°)
-    // When phone is flat on table (screen up):
-    // - naz ~ +1.0 (pointing at ground: altitude ~ -90°)
-    // Therefore, camera optical ray altitude is atan2(-naz, -nay):
-    const altitudeRad = Math.atan2(-naz, -nay);
-    const altitudeDeg = altitudeRad * (180 / Math.PI);
+    if (prev > 0 && this.q) {
+      const dt = clamp((now - prev) / 1000, 0, 0.1);
+      const w: V3 = [d.x * GYRO_SIGN, d.y * GYRO_SIGN, d.z * GYRO_SIGN]; // rad/s in DEVICE axes
+      const rate = len(w);
+      if (rate > 1e-6 && dt > 0) {
+        const half = (rate * dt) / 2;
+        const axis = scale(w, 1 / rate);
+        const s = Math.sin(half);
+        const dq: Q = [Math.cos(half), axis[0] * s, axis[1] * s, axis[2] * s];
+        // body-frame rotation -> right-multiply
+        this.q = qNormalize(qMul(this.q, dq));
+      }
+    }
+    this.correctAndEmit(now);
+  }
 
-    // Roll (tilt side-to-side)
-    const rollRad = Math.atan2(nax, -nay);
-    const rollDeg = rollRad * (180 / Math.PI);
+  /* --------------------------- core step ---------------------------- */
+  private measuredQuat(): Q | null {
+    if (!this.accel || !this.mag) return null;
 
-    // Compass Heading of the back camera:
-    // Magnetometer heading reading.heading (or tilt-compensated)
-    // In portrait when aiming forward:
-    let magneticHeading = this.smoothedMag.heading;
-    
-    // Tilt compensation:
-    const cosRoll = Math.cos(rollRad);
-    const sinRoll = Math.sin(rollRad);
-    const cosPitch = Math.cos(altitudeRad);
-    const sinPitch = Math.sin(altitudeRad);
+    const sign = GRAVITY_READING_IS_DOWN ? -1 : 1;
+    const up = norm([this.accel[0] * sign, this.accel[1] * sign, this.accel[2] * sign]);
+    if (!up) return null;
 
-    const Xh = mx * cosRoll + mz * sinRoll;
-    const Yh = mx * sinPitch * sinRoll + my * cosPitch - mz * sinPitch * cosRoll;
+    const east0 = norm(cross(this.mag, up));
+    if (!east0) return null; // field parallel to gravity -> heading undefined
+    const north0 = cross(up, east0) as V3;
 
-    let tiltCompensatedHeading = Math.atan2(-Xh, Yh) * (180 / Math.PI);
-    if (tiltCompensatedHeading < 0) tiltCompensatedHeading += 360;
+    // Rotate magnetic north -> true north around "up" (declination east positive)
+    const d = (this.declinationDeg * Math.PI) / 180;
+    const c = Math.cos(d);
+    const s = Math.sin(d);
+    const north: V3 = [
+      north0[0] * c - east0[0] * s,
+      north0[1] * c - east0[1] * s,
+      north0[2] * c - east0[2] * s,
+    ];
+    const east: V3 = [
+      east0[0] * c + north0[0] * s,
+      east0[1] * c + north0[1] * s,
+      east0[2] * c + north0[2] * s,
+    ];
 
-    // Use tilt-compensated heading when valid, fallback to magnetometer heading
-    const targetHeading = !isNaN(tiltCompensatedHeading) ? tiltCompensatedHeading : magneticHeading;
+    // Rows = East, North, Up expressed in device coords  ==  device -> world matrix
+    const M: Mat3 = [
+      east[0], east[1], east[2],
+      north[0], north[1], north[2],
+      up[0], up[1], up[2],
+    ];
+    return qFromMatrix(M);
+  }
 
-    // Smooth fusion into azimuth
-    let diff = (targetHeading - this.currentAzimuth + 540) % 360 - 180;
-    this.currentAzimuth = (this.currentAzimuth + diff * 0.25 + 360) % 360;
+  private confidence(): 'high' | 'medium' | 'low' {
+    if (!this.mag) return 'low';
+    const b = len(this.mag);
+    if (b < 15 || b > 90) return 'low';
+    if (b < 22 || b > 75) return 'medium';
+    return 'high';
+  }
 
-    this.currentAltitude = this.currentAltitude + 0.3 * (altitudeDeg - this.currentAltitude);
-    this.currentRoll = rollDeg;
-    this.currentPitch = altitudeDeg;
+  private correctAndEmit(now: number): void {
+    const meas = this.measuredQuat();
+    if (!meas) return;
 
-    // Heading confidence check based on magnetic field strength (typical Earth B-field: 25 to 65 μT)
-    const bFieldNorm = Math.sqrt(mx * mx + my * my + mz * mz);
-    let headingConfidence: 'high' | 'medium' | 'low' = 'high';
-    if (bFieldNorm < 15 || bFieldNorm > 90) {
-      headingConfidence = 'low';
-    } else if (bFieldNorm < 22 || bFieldNorm > 75) {
-      headingConfidence = 'medium';
+    const dt = this.lastCorrectTs ? clamp((now - this.lastCorrectTs) / 1000, 0.001, 0.1) : 0.03;
+    this.lastCorrectTs = now;
+
+    if (!this.q) {
+      this.q = meas;
+    } else {
+      // time-constant gain (frame-rate independent): gyro trusted short-term, accel/mag long-term
+      const tau = this.gyroActive(now) ? 0.6 : 0.12;
+      let k = 1 - Math.exp(-dt / tau);
+      if (this.confidence() === 'low') k *= 0.2; // distorted field: lean on the gyro
+      this.q = qNlerp(this.q, meas, k);
     }
 
-    const orientation: DeviceOrientation = {
-      azimuth: this.currentAzimuth,
-      altitude: this.currentAltitude,
-      roll: this.currentRoll,
-      pitch: this.currentPitch,
-      timestamp: Date.now(),
-      headingConfidence
+    const matrix = qToMatrix(this.q);
+    const { altitude, azimuth, roll } = orientationFromMatrix(matrix);
+
+    this.last = {
+      azimuth,
+      altitude,
+      roll,
+      pitch: altitude,
+      timestamp: now,
+      headingConfidence: this.confidence(),
+      matrix,
     };
-
-    this.notify(orientation);
-  }
-
-  private notify(orientation: DeviceOrientation): void {
-    this.listeners.forEach((listener) => listener(orientation));
-  }
-
-  public getOrientation(): DeviceOrientation {
-    return {
-      azimuth: this.currentAzimuth,
-      altitude: this.currentAltitude,
-      roll: this.currentRoll,
-      pitch: this.currentPitch,
-      timestamp: Date.now()
-    };
+    this.listeners.forEach((l) => l(this.last));
   }
 }

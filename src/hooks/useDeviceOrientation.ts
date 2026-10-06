@@ -9,35 +9,36 @@ export function useDeviceOrientation(overrideOrientation?: Partial<DeviceOrienta
     roll: 0,
     pitch: 45,
     timestamp: Date.now(),
-    headingConfidence: 'high'
+    headingConfidence: 'high',
   });
 
   useEffect(() => {
     if (overrideOrientation) {
+      // matrix: undefined -> SkyOverlay rebuilds it from the manual alt/az instead of using a stale live one
       setOrientation((prev) => ({
         ...prev,
         ...overrideOrientation,
-        timestamp: Date.now()
+        matrix: undefined,
+        timestamp: Date.now(),
       }));
       return;
     }
 
-    const sensorFusion = SensorFusion.getInstance();
-    sensorFusion.start();
+    const fusion = SensorFusion.getInstance();
+    fusion.start();
 
-    // Throttle UI orientation updates to ~30Hz
     let lastUpdate = 0;
-    const unsub = sensorFusion.subscribe((newOrientation) => {
+    const unsub = fusion.subscribe((o) => {
       const now = Date.now();
       if (now - lastUpdate >= 33) {
         lastUpdate = now;
-        setOrientation(newOrientation);
+        setOrientation(o);
       }
     });
 
     return () => {
       unsub();
-      sensorFusion.stop();
+      fusion.stop();
     };
   }, [overrideOrientation]);
 
